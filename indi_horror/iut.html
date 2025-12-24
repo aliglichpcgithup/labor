@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>SMILE: WHITE GHOST</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; font-family: 'Courier New', monospace; color: white; text-transform: uppercase; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+
+        /* ИНТЕРФЕЙС КАМЕРЫ */
+        #cam-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 100; padding: 20px; box-sizing: border-box; }
+        .corner { position: absolute; width: 60px; height: 40px; border: 2px solid rgba(255,255,255,0.4); }
+        .top-left { top: 40px; left: 40px; border-right: 0; border-bottom: 0; }
+        .top-right { top: 40px; right: 40px; border-left: 0; border-bottom: 0; }
+        .bottom-left { bottom: 40px; left: 40px; border-right: 0; border-top: 0; }
+        .bottom-right { bottom: 40px; right: 40px; border-left: 0; border-top: 0; }
+
+        .top-bar { position: absolute; top: 50px; left: 110px; right: 110px; display: flex; justify-content: space-between; align-items: center; }
+        .battery-icon { width: 35px; height: 18px; border: 2px solid white; position: relative; padding: 2px; }
+        .battery-icon::after { content: ''; position: absolute; right: -5px; top: 4px; width: 3px; height: 6px; background: white; }
+        #bat-level { height: 100%; background: #fff; width: 100%; transition: width 0.1s; }
+        .rec-dot { width: 12px; height: 12px; background: red; border-radius: 50%; animation: blink 1s infinite; display: inline-block; margin-right: 10px; }
+
+        .bottom-bar { position: absolute; bottom: 50px; left: 110px; right: 110px; display: flex; justify-content: space-between; align-items: flex-end; font-size: 12px; }
+
+        /* СКРИМЕР */
+        #scary-face {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #fff; display: none; z-index: 1000;
+            justify-content: center; align-items: center;
+        }
+        #scary-face img { width: 100%; height: 100%; object-fit: cover; filter: invert(1); }
+
+        #flash-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: white; opacity: 0; pointer-events: none; z-index: 200; }
+        @keyframes blink { 50% { opacity: 0; } }
+        @keyframes shake { 0% { transform: translate(0,0); } 25% { transform: translate(5px,5px); } 50% { transform: translate(-5px,0); } 75% { transform: translate(0,-5px); } }
+        .shaking { animation: shake 0.05s infinite; }
+    </style>
+</head>
+<body>
+
+<div id="flash-overlay"></div>
+<div id="scary-face"><img src="https://i.postimg.cc/m2tMv6Yf/scary.jpg"></div>
+
+<div id="cam-overlay">
+    <div class="corner top-left"></div><div class="corner top-right"></div>
+    <div class="corner bottom-left"></div><div class="corner bottom-right"></div>
+    <div class="top-bar">
+        <div style="display:flex; align-items:center; gap:10px;">
+            <div class="battery-icon"><div id="bat-level"></div></div>
+            <span id="bat-text">READY</span>
+        </div>
+        <div><div class="rec-dot"></div><span>REC</span></div>
+    </div>
+    <div class="bottom-bar">
+        <div id="timecode">00:00:00:00</div>
+        <div id="status-msg" style="color: yellow; opacity: 0;">WARNING: MOTION</div>
+        <div style="opacity:0.6;">ISO 12800 | F 5.6</div>
+    </div>
+</div>
+
+<canvas id="game"></canvas>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const flashOverlay = document.getElementById('flash-overlay');
+
+let flashReady = 1.0;
+let flashAnim = 0;
+let isStarted = false;
+let keys = {};
+let startTime = 0;
+let monsterSpawnTime = 0;
+
+// Карта
+const mapSize = 12;
+const map = [
+    1,1,1,1,1,1,1,1,1,1,1,1,
+    1,0,0,0,0,0,1,0,0,0,0,1,
+    1,0,1,1,1,0,1,0,1,1,0,1,
+    1,0,0,0,1,0,0,0,1,0,0,1,
+    1,1,0,0,0,0,1,0,0,0,1,1,
+    1,0,0,1,1,0,1,1,1,0,0,1,
+    1,0,0,0,0,0,0,0,0,0,0,1,
+    1,1,1,0,1,1,1,0,1,1,0,1,
+    1,0,0,0,0,0,1,0,0,0,0,1,
+    1,0,1,1,1,0,0,0,1,1,0,1,
+    1,1,1,1,1,1,1,1,1,1,1,1
+];
+
+let player = { x: 1.5, y: 1.5, dir: 0 };
+let enemy = { x: 10.5, y: 10.5, state: 'idle' };
+
+// Генератор звука скримера
+function playScream() {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(40, audioCtx.currentTime + 1);
+    gain.gain.linearRampToValueAtTime(1, audioCtx.currentTime);
+    gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 1);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + 1);
+}
+
+function takePhoto() {
+    if (flashReady < 0.95 || !isStarted) return;
+    flashReady = 0; flashAnim = 1.0;
+
+    let dx = enemy.x - player.x, dy = enemy.y - player.y;
+    let dist = Math.sqrt(dx*dx + dy*dy);
+    let angleToEnemy = Math.atan2(dy, dx);
+    let angleDiff = Math.abs(angleToEnemy - player.dir);
+    if (angleDiff > Math.PI) angleDiff = Math.PI * 2 - angleDiff;
+
+    // Проверка видимости монстра (нельзя спугнуть через стену)
+    let hitWall = false;
+    for(let d=0; d<dist; d+=0.1) {
+        if(map[Math.floor(player.y + Math.sin(angleToEnemy)*d)*mapSize + Math.floor(player.x + Math.cos(angleToEnemy)*d)] === 1) {
+            hitWall = true; break;
+        }
+    }
+
+    if (!hitWall && angleDiff < 0.7 && dist < 10) {
+        // Прогоняем монстра
+        enemy.x = 10.5; enemy.y = 10.5;
+        enemy.state = 'idle';
+        monsterSpawnTime = Date.now();
+        document.getElementById('status-msg').style.opacity = "0";
+    }
+
+    flashOverlay.style.transition = "none";
+    flashOverlay.style.opacity = "1";
+    setTimeout(() => { flashOverlay.style.transition = "opacity 0.8s"; flashOverlay.style.opacity = "0"; }, 50);
+}
+
+window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (e.code === 'Space') takePhoto();
+});
+window.addEventListener('keyup', (e) => keys[e.code] = false);
+window.addEventListener('mousemove', (e) => { if (document.pointerLockElement) player.dir += e.movementX * 0.0015; });
+
+function update() {
+    if (!isStarted) return;
+    
+    // Движение
+    let moveSpeed = 0.015;
+    let oldX = player.x, oldY = player.y;
+    if (keys['KeyW']) { player.x += Math.cos(player.dir) * moveSpeed; player.y += Math.sin(player.dir) * moveSpeed; }
+    if (keys['KeyS']) { player.x -= Math.cos(player.dir) * moveSpeed; player.y -= Math.sin(player.dir) * moveSpeed; }
+    if (map[Math.floor(player.y) * mapSize + Math.floor(player.x)] === 1) { player.x = oldX; player.y = oldY; }
+
+    if (flashReady < 1) flashReady += 0.006;
+    if (flashAnim > 0) flashAnim -= 0.04;
+
+    // Тайка и ИИ монстра
+    let timeIdle = (Date.now() - monsterSpawnTime) / 1000;
+    if (timeIdle > 10) {
+        enemy.state = 'chase';
+        document.getElementById('status-msg').style.opacity = "1";
+    }
+
+    if (enemy.state === 'chase') {
+        let dx = player.x - enemy.x, dy = player.y - enemy.y;
+        let dist = Math.sqrt(dx*dx + dy*dy);
+        enemy.x += (dx / dist) * 0.025;
+        enemy.y += (dy / dist) * 0.025;
+        if (dist < 0.4) {
+            document.getElementById('scary-face').style.display = 'flex';
+            document.body.classList.add('shaking');
+            playScream();
+            setTimeout(() => location.reload(), 1500);
+        }
+    }
+
+    // UI
+    let elapsed = Date.now() - startTime;
+    let sec = Math.floor((elapsed / 1000) % 60).toString().padStart(2, '0');
+    let min = Math.floor((elapsed / 60000) % 60).toString().padStart(2, '0');
+    document.getElementById('timecode').innerText = `00:${min}:${sec}:00`;
+    document.getElementById('bat-level').style.width = (flashReady * 100) + "%";
+}
+
+function draw() {
+    canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+    ctx.fillStyle = '#050000'; ctx.fillRect(0,0,canvas.width, canvas.height);
+
+    const fov = 1.3, rays = 180;
+    let zBuffer = [];
+
+    for(let i=0; i<rays; i++) {
+        let angle = (player.dir - fov/2) + (i/rays)*fov;
+        let d = 0;
+        while(d < 14) {
+            d += 0.08;
+            if(map[Math.floor(player.y + Math.sin(angle)*d)*mapSize + Math.floor(player.x + Math.cos(angle)*d)] === 1) break;
+        }
+        zBuffer[i] = d;
+        let h = canvas.height / (d * Math.cos(angle - player.dir));
+        let light = Math.max(0.35 - d/10, flashAnim * (2.2 - d/6));
+        let c = Math.min(255, 255 * light);
+        ctx.fillStyle = flashAnim > 0.1 ? `rgb(${c},${c},${c})` : `rgb(${c},0,0)`;
+        ctx.fillRect(i*(canvas.width/rays), (canvas.height-h)/2, (canvas.width/rays)+1, h);
+    }
+
+    // Отрисовка монстра
+    let mdx = enemy.x - player.x, mdy = enemy.y - player.y;
+    let mdist = Math.sqrt(mdx*mdx + mdy*mdy);
+    let mAngle = Math.atan2(mdy, mdx) - player.dir;
+    if (mAngle < -Math.PI) mAngle += Math.PI * 2;
+    if (mAngle > Math.PI) mAngle -= Math.PI * 2;
+
+    if (Math.abs(mAngle) < fov/2) {
+        let rayIdx = Math.floor((mAngle / fov + 0.5) * rays);
+        if (mdist < zBuffer[rayIdx]) {
+            let screenX = (mAngle / fov + 0.5) * canvas.width;
+            let h = canvas.height / (mdist * Math.cos(mAngle));
+            ctx.fillStyle = `rgba(255, 255, 255, ${Math.max(0.4, flashAnim)})`;
+            ctx.shadowBlur = 15; ctx.shadowColor = "white";
+            ctx.fillRect(screenX - h/4, (canvas.height - h)/2, h/2, h);
+            ctx.shadowBlur = 0;
+        }
+    }
+}
+
+function loop() {
+    update(); draw();
+    requestAnimationFrame(loop);
+}
+
+canvas.onclick = () => { 
+    canvas.requestPointerLock(); 
+    if(!isStarted){ isStarted=true; startTime=Date.now(); monsterSpawnTime=Date.now(); loop(); } 
+};
+</script>
+</body>
+</html>
